@@ -130,8 +130,21 @@ class ImageApproveRequest(BaseModel):
 @router.get("/categories", response_model=dict)
 def get_categories(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     categories = db.query(Category).order_by(Category.class_name.asc()).all()
-    results = [
-        {
+    results = []
+    for c in categories:
+        img_count = db.query(Image).filter(
+            (Image.selected_category_id == c.category_id) |
+            (func.lower(Image.ai_predicted_category) == c.class_name.lower())
+        ).count()
+        validated_img_count = db.query(Image).filter(
+            ((Image.selected_category_id == c.category_id) | (func.lower(Image.ai_predicted_category) == c.class_name.lower())),
+            (Image.status.in_(["approved", "annotated", "yolo_ready", "permanent"])) | (Image.is_validated == True)
+        ).count()
+        effective_count = max(c.validated_count or 0, validated_img_count, img_count)
+        if (c.validated_count or 0) < effective_count:
+            c.validated_count = effective_count
+
+        results.append({
             "id": c.category_id,
             "category_id": c.category_id,
             "name": c.class_name,
@@ -140,11 +153,14 @@ def get_categories(admin: User = Depends(require_admin), db: Session = Depends(g
             "class_code": c.class_code,
             "description": c.description,
             "is_active": c.is_active,
-            "validated_count": c.validated_count or 0,
-            "total_images": db.query(Image).filter(Image.selected_category_id == c.category_id).count()
-        }
-        for c in categories
-    ]
+            "validated_count": effective_count,
+            "total_images": img_count,
+            "uploaded_count": img_count,
+        })
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     return {"categories": results}
 
 
@@ -415,6 +431,11 @@ def approve_image(image_id: str, request_in: ImageApproveRequest, admin: User = 
                 description=f"Approved image validation reward: {img.original_filename}"
             )
             db.add(tx)
+
+        if img.selected_category_id:
+            cat = db.query(Category).filter(Category.category_id == img.selected_category_id).first()
+            if cat:
+                cat.validated_count = (cat.validated_count or 0) + 1
             
     elif action == "reject":
         img.status = "rejected"
@@ -608,25 +629,35 @@ def analytics_details(
         durations.append(diff)
     avg_duration = sum(durations) / len(durations) if durations else 0.0
     
-    top_contributors = (
+    all_users = (
         db.query(User.user_id, User.email, User.full_name, User.image_count, User.reward_points)
         .filter(User.role == "user")
-        .order_by(User.image_count.desc())
-        .limit(10)
         .all()
     )
     contributor_stats = []
-    for row in top_contributors:
-        approved_count = row[3] or 0
-        uploaded_count = db.query(Image).filter(Image.user_id == row[0]).count()
+    for row in all_users:
+        user_id = row[0]
+        db_approved = db.query(Image).filter(
+            Image.user_id == user_id,
+            (Image.status.in_(["approved", "annotated", "yolo_ready", "permanent"])) | (Image.is_validated == True)
+        ).count()
+        approved_count = max(row[3] or 0, db_approved)
+        uploaded_count = max(db.query(Image).filter(Image.user_id == user_id).count(), approved_count)
+        reward_pts = row[4] or 0
         contributor_stats.append({
-            "user_id": row[0],
+            "user_id": user_id,
             "email": row[1],
             "full_name": row[2],
             "approved": approved_count,
-            "uploads": max(uploaded_count, approved_count),
-            "reward_points": row[4] or 0
+            "uploads": uploaded_count,
+            "reward_points": reward_pts
         })
+    # Sort so users with active contributions (approved, uploads, rewards) always rank above zeros
+    contributor_stats.sort(
+        key=lambda c: (c["approved"], c["uploads"], c["reward_points"]),
+        reverse=True
+    )
+    contributor_stats = contributor_stats[:10]
     
     return {
         "summary": {
